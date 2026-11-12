@@ -465,7 +465,7 @@ function StationManagement({ stations, onSaved }) {
 
   return <section className="station-management"><div className="station-management-heading"><div><span className="section-kicker">ADMINISTRATION</span><h3>Manage stations</h3><p>Add or edit nodes, locations, operating state, and water warning limits.</p></div><label className="station-select-label" htmlFor="station-edit-selector">Edit existing node<select id="station-edit-selector" name="station_edit_selector" value={selectedId} onChange={chooseStation}><option value="">Add new station</option>{sortedStations.map((station) => <option key={station.id} value={station.id}>{station.station_code} / {station.location_name}</option>)}</select></label></div>
     <form className="station-admin-form" onSubmit={saveStation}>
-      <label>Station code<input name="station_code" value={form.station_code} onChange={updateField} maxLength={32} placeholder="CAL-DRN-01" required/></label>
+      <label>Station code<input name="station_code" value={form.station_code} onChange={updateField} maxLength={32} placeholder="CAL-DRN-01" required readOnly={editing} aria-readonly={editing} title={editing ? 'Station codes cannot be changed after a station is created.' : undefined}/></label>
       <label>Location name<input name="location_name" value={form.location_name} onChange={updateField} maxLength={255} placeholder="Drainage location" required/></label>
       <label>Latitude<input name="latitude" type="number" min="-90" max="90" step="any" value={form.latitude} onChange={updateField} required/></label>
       <label>Longitude<input name="longitude" type="number" min="-180" max="180" step="any" value={form.longitude} onChange={updateField} required/></label>
