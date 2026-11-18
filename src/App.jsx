@@ -1,6 +1,6 @@
 import { Component, useCallback, useEffect, useRef, useState } from 'react';
 import {
-  Activity, AlertTriangle, ArrowUp, BatteryCharging, Check, CheckCircle2,
+  Activity, AlertTriangle, ArrowUp, Check, CheckCircle2,
   ChevronRight, CircleHelp, Clock3, Clock4, Cog, Database, Droplet,
   FileDown, Gauge, LogOut, MapPin, PanelsTopLeft, RefreshCw, Send, ShieldAlert,
   Waves, LocateFixed, Sun, Moon, Settings, SlidersHorizontal, KeyRound, Eye, EyeOff, Menu, X, UserCheck,
@@ -43,6 +43,7 @@ const formatValue = (value, digits = 1) => value == null || value === ''
   : Number.isFinite(Number(value)) ? Number(value).toFixed(digits) : value;
 const readingFor = (station) => station?.latest_reading || station?.latestReading || station?.sensor_readings?.[0] || station?.latest_sensor_reading || null;
 const stationConnectivityStatus = (station) => {
+  if (typeof station?.is_online === 'boolean') return station.is_online ? 'online' : 'offline';
   if (station?.status === 'maintenance') return 'maintenance';
   return station?.status === 'active' ? 'online' : 'offline';
 };
@@ -53,19 +54,29 @@ const formatPhilippineTime = (value) => {
   return Number.isNaN(date.getTime()) ? '--' : `${date.toLocaleString('en-PH', { timeZone: PH_TIME_ZONE, dateStyle: 'medium', timeStyle: 'short' })} PST (UTC+8)`;
 };
 const evaluateDrainageCondition = (reading, station) => {
-  if (!reading || reading.water_level_cm == null) {
-    return { code: 'unknown', label: 'Awaiting data', flowRateLpm: null };
+  const rawWaterLevel = reading?.water_level_cm;
+  const waterLevel = rawWaterLevel == null || rawWaterLevel === '' ? null : Number(rawWaterLevel);
+  if (station?.is_online === false || !reading || waterLevel === null || !Number.isFinite(waterLevel)) {
+    return { code: 'awaiting_data', label: 'Awaiting data', blockageStatus: 'Awaiting data', blockageDetected: false, severity: 'offline', badge: 'OFFLINE', flowRateLpm: null };
   }
-  const waterLevel = Number(reading.water_level_cm);
-  const threshold = Number(station?.warning_threshold_cm || 60);
-  if (waterLevel < threshold) return { code: 'normal', label: 'Clear / Safe', flowRateLpm: reading.flow_rate == null ? null : Number(reading.flow_rate) };
-  if (reading.flow_rate == null) return { code: 'unknown', label: 'Awaiting flow data', flowRateLpm: null };
-  const flowRateLpm = Number(reading.flow_rate);
-  if (waterLevel >= threshold && flowRateLpm < 1.0) return { code: 'blockage_detected', label: 'Blockage Detected', flowRateLpm };
-  if (waterLevel >= threshold && flowRateLpm >= 1.0) return { code: 'elevated_water', label: 'Elevated Water', flowRateLpm };
-  return { code: 'normal', label: 'Clear / Safe', flowRateLpm };
+
+  const rawFlowRate = reading.flow_rate_lpm ?? reading.flow_rate;
+  const numericFlowRate = rawFlowRate == null || rawFlowRate === '' ? null : Number(rawFlowRate);
+  const flowRateLpm = Number.isFinite(numericFlowRate) ? numericFlowRate : null;
+  const rawThreshold = station?.warning_threshold_cm;
+  const parsedThreshold = rawThreshold == null || rawThreshold === '' ? 60 : Number(rawThreshold);
+  const warningThresholdCm = Number.isFinite(parsedThreshold) ? parsedThreshold : 60;
+  const lowFlow = (flowRateLpm ?? 0) < 1.0;
+
+  if (waterLevel >= warningThresholdCm && lowFlow) {
+    return { code: 'blockage_detected', label: 'Blockage Detected', blockageStatus: 'Blockage Detected', blockageDetected: true, severity: 'critical', badge: 'CRITICAL', flowRateLpm };
+  }
+  if (waterLevel > 5.0 && lowFlow) {
+    return { code: 'stagnant_low_flow', label: 'Stagnant / Low Flow', blockageStatus: 'Stagnant / Low Flow', blockageDetected: false, severity: 'warning', badge: 'WARNING', flowRateLpm };
+  }
+  return { code: 'normal', label: 'Clear / Safe', blockageStatus: 'Clear / Safe', blockageDetected: false, severity: 'safe', badge: 'SAFE', flowRateLpm };
 };
-const conditionTone = (code) => code === 'blockage_detected' ? 'critical' : code === 'elevated_water' ? 'warning' : code === 'normal' ? 'normal' : 'unknown';
+const conditionTone = (code) => code === 'blockage_detected' ? 'critical' : ['elevated_water', 'stagnant_low_flow'].includes(code) ? 'warning' : code === 'normal' ? 'normal' : 'unknown';
 
 class DashboardErrorBoundary extends Component {
   state = { error: null };
@@ -380,15 +391,16 @@ function ReportsList({ reports, loading, error, isAdmin, onStatusUpdate }) {
 function StationCard({ station, stationId }) {
   const reading = readingFor(station);
   const water = reading?.water_level_cm;
+  const hasWater = station?.is_online !== false && Boolean(reading) && water != null && water !== '' && Number.isFinite(Number(water));
   const threshold = Number(station.warning_threshold_cm || 60);
   const condition = evaluateDrainageCondition(reading, station);
   const tone = conditionTone(condition.code);
   const nodeStatus = stationConnectivityStatus(station);
-  const syncedAt = reading?.recorded_at || reading?.created_at || reading?.timestamp;
+  const syncedAt = reading?.recorded_at || reading?.created_at || reading?.timestamp || station.last_synced_at;
   return <article className="station-card" id={stationId}>
     <div className="station-heading"><div className="station-title"><span className="station-code">{station.station_code || 'UNASSIGNED'}</span><h2>{station.location_name || 'Unnamed location'}</h2><p className="location-line"><MapPin size={14}/>{station.latitude}, {station.longitude}</p></div><span className={`status-pill ${nodeStatus}`}><i/>{nodeStatus === 'maintenance' ? 'Maintenance' : nodeStatus === 'online' ? 'Online' : 'Offline'}</span></div>
-    <div className="metrics-grid"><div className={`metric-tile water-${tone}`}><div className="metric-label"><Droplet size={16}/>Water level</div><div className="metric-value">{formatValue(water)} <small>cm</small></div><div className="level-track"><span style={{ width: `${Math.min(100, Math.max(0, Number(water) || 0))}%` }}/></div><div className="metric-hint">Warning at {formatValue(threshold, 0)} cm</div></div><div className="metric-tile flow-tile"><div className="metric-label"><Waves size={16}/>Flow rate</div><div className="metric-value">{formatValue(condition.flowRateLpm, 1)} <small>L/min</small></div><div className="metric-hint">Live sensor reading</div></div><div className={`blockage-tile ${tone}`}><span className="blockage-icon">{tone === 'critical' ? <ShieldAlert size={17}/> : tone === 'warning' ? <ArrowUp size={17}/> : tone === 'unknown' ? <CircleHelp size={17}/> : <Check size={17}/>}</span><span><small>Drainage condition</small><strong>{condition.label}</strong></span></div></div>
-    <footer className="station-footer"><span><BatteryCharging size={15}/>{formatValue(reading?.battery_voltage, 2)} V</span><span className="sync-time">Last sync / {syncedAt ? formatPhilippineTime(syncedAt) : 'No readings yet'}</span></footer>
+    <div className="metrics-grid"><div className={`metric-tile water-${tone}`}><div className="metric-label"><Droplet size={16}/>Water level</div><div className="metric-value">{hasWater ? <>{formatValue(water)} <small>cm</small></> : '--'}</div><div className="level-track"><span style={{ width: hasWater ? `${Math.min(100, Math.max(0, Number(water)))}%` : '0%' }}/></div><div className="metric-hint">{hasWater ? `Warning at ${formatValue(threshold, 0)} cm` : 'Awaiting data'}</div></div><div className="metric-tile flow-tile"><div className="metric-label"><Waves size={16}/>Flow rate</div><div className="metric-value">{condition.flowRateLpm == null ? '--' : <>{formatValue(condition.flowRateLpm, 1)} <small>L/min</small></>}</div><div className="metric-hint">{condition.flowRateLpm == null ? 'Awaiting data' : 'Live sensor reading'}</div></div><div className={`blockage-tile ${tone}`}><span className="blockage-icon">{tone === 'critical' ? <ShieldAlert size={17}/> : tone === 'warning' ? <ArrowUp size={17}/> : tone === 'unknown' || tone === 'awaiting_data' ? <CircleHelp size={17}/> : <Check size={17}/>}</span><span><small>Drainage condition</small><strong>{condition.label}</strong></span></div></div>
+    <footer className="station-footer"><span className="sync-time">Last sync / {syncedAt ? formatPhilippineTime(syncedAt) : 'No readings yet'}</span></footer>
   </article>;
 }
 
@@ -480,18 +492,24 @@ function StationManagement({ stations, onSaved }) {
 function TelemetryCards({ station }) {
   const reading = station ? readingFor(station) : null;
   const current = reading || {};
-  const water = Number(current.water_level_cm) || 0;
+  const rawWaterLevel = current.water_level_cm;
+  const waterValue = rawWaterLevel == null || rawWaterLevel === '' ? null : Number(rawWaterLevel);
+  const hasWater = station?.is_online !== false && Boolean(reading) && Number.isFinite(waterValue);
+  const rawFlowValue = current.flow_rate_lpm ?? current.flow_rate;
+  const flowValue = rawFlowValue == null || rawFlowValue === '' ? null : Number(rawFlowValue);
+  const hasFlow = hasWater && Number.isFinite(flowValue);
+  const water = hasWater ? waterValue : null;
   const condition = evaluateDrainageCondition(reading, station);
   const tone = conditionTone(condition.code);
   const hasHighWater = condition.code === 'blockage_detected' || condition.code === 'elevated_water';
-  const isBlocked = condition.code === 'blockage_detected';
+  const isBlocked = condition.blockageDetected;
   const flowPerMinute = condition.flowRateLpm;
-  return <><SectionHeading kicker="SYSTEM MONITORING" title="Live Drainage Status" description={station ? `${station.station_code} / ${station.location_name}` : 'Select a station to view its latest readings.'} aside={<span className={`live-badge ${reading ? 'is-live' : ''}`}><i/>{reading ? 'LIVE DATA' : 'NO DATA'}</span>}/>
+  return <><SectionHeading kicker="SYSTEM MONITORING" title="Live Drainage Status" description={station ? `${station.station_code} / ${station.location_name}` : 'Select a station to view its latest readings.'} aside={<span className={`live-badge ${hasWater ? 'is-live' : ''}`}><i/>{hasWater ? 'LIVE DATA' : 'NO DATA'}</span>}/>
     <div className="live-grid">
-      <article className="live-card"><div className="live-card-top"><span className="live-icon cyan"><Droplet size={18}/></span><span className={`condition-badge ${tone}`}>{tone === 'unknown' ? 'NO DATA' : hasHighWater ? 'WARNING' : 'NORMAL'}</span></div><p className="live-card-label">Water Level</p><div className="live-reading">{formatValue(current.water_level_cm)}<small> cm</small></div><div className="water-progress"><span style={{ width: `${Math.min(100, Math.max(0, water))}%` }}/></div><div className="live-card-foot"><span>0 cm</span><span>100 cm scale</span></div></article>
-      <article className="live-card"><div className="live-card-top"><span className="live-icon blue"><Waves size={18}/></span><span className={`condition-badge ${tone === 'unknown' ? 'unknown' : flowPerMinute >= 1 ? 'normal' : 'warning'}`}>{tone === 'unknown' ? 'NO DATA' : flowPerMinute >= 1 ? 'FLOWING' : 'LOW FLOW'}</span></div><p className="live-card-label">Water Flow</p><div className="live-reading">{formatValue(flowPerMinute)}<small> L/min</small></div>{reading ? <div className="equalizer" aria-label="Flow visualization">{[34,58,76,47,90,64,38,70,50,82,44,63].map((height, index) => <i key={index} style={{ '--bar-height': `${height}%`, '--bar-delay': `${index * 65}ms` }}/>)}</div> : <p className="live-card-note">A flow reading will appear after this station reports data.</p>}<div className="live-card-foot"><span>Flow rate</span><span>Latest station reading</span></div></article>
+      <article className="live-card"><div className="live-card-top"><span className="live-icon cyan"><Droplet size={18}/></span>{hasWater && <span className={`condition-badge ${tone}`}>{hasHighWater ? 'WARNING' : 'NORMAL'}</span>}</div><p className="live-card-label">Water Level</p><div className="live-reading">{hasWater ? <>{formatValue(current.water_level_cm)}<small> cm</small></> : '--'}</div><div className="water-progress"><span style={{ width: `${hasWater ? Math.min(100, Math.max(0, water)) : 0}%` }}/></div><div className="live-card-foot"><span>0 cm</span><span>100 cm scale</span></div></article>
+      <article className="live-card"><div className="live-card-top"><span className="live-icon blue"><Waves size={18}/></span>{hasFlow && <span className={`condition-badge ${flowPerMinute >= 1 ? 'normal' : 'warning'}`}>{flowPerMinute >= 1 ? 'FLOWING' : 'LOW FLOW'}</span>}</div><p className="live-card-label">Water Flow</p><div className="live-reading">{hasFlow ? <>{formatValue(flowPerMinute)}<small> L/min</small></> : '--'}</div>{hasFlow ? <div className="equalizer" aria-label="Flow visualization">{[34,58,76,47,90,64,38,70,50,82,44,63].map((height, index) => <i key={index} style={{ '--bar-height': `${height}%`, '--bar-delay': `${index * 65}ms` }}/>)}</div> : <p className="live-card-note">Awaiting data</p>}<div className="live-card-foot"><span>Flow rate</span><span>Latest station reading</span></div></article>
       <article className="live-card"><div className="live-card-top"><span className={`live-icon ${tone === 'critical' ? 'rose' : tone === 'warning' ? 'amber' : tone === 'unknown' ? 'unknown' : 'green'}`}>{tone === 'critical' ? <AlertTriangle size={18}/> : tone === 'warning' ? <ArrowUp size={18}/> : tone === 'unknown' ? <CircleHelp size={18}/> : <Check size={18}/>}</span><span className={`condition-badge ${tone}`}>{tone === 'critical' ? 'CRITICAL' : tone === 'warning' ? 'WARNING' : tone === 'unknown' ? 'NO DATA' : 'CLEAR'}</span></div><p className="live-card-label">Drainage Status</p><div className={`status-reading ${tone === 'critical' ? 'is-critical' : tone === 'warning' ? 'is-warning' : ''}`}>{tone === 'critical' ? <AlertTriangle size={23}/> : tone === 'warning' ? <ArrowUp size={25}/> : tone === 'unknown' ? <CircleHelp size={22}/> : <Check size={24}/>}<strong>{condition.label}</strong></div><p className="live-card-note">{station?.location_name || 'Select a station'}</p></article>
-      <article className="live-card"><div className="live-card-top"><span className={`live-icon ${isBlocked ? 'rose' : tone === 'unknown' ? 'unknown' : 'green'}`}><ShieldAlert size={18}/></span><span className={`condition-badge ${isBlocked ? 'critical' : tone === 'unknown' ? 'unknown' : 'normal'}`}>{isBlocked ? 'DETECTED' : tone === 'unknown' ? 'NO DATA' : 'SAFE'}</span></div><p className="live-card-label">Blockage Detection</p><div className={`status-reading ${isBlocked ? 'is-critical' : ''}`}><span className={`safe-indicator ${isBlocked ? 'unsafe' : ''}`}/><strong>{tone === 'unknown' ? 'Awaiting data' : isBlocked ? 'Blockage Detected' : 'Not Detected'}</strong></div><p className="live-card-note">Based on water depth and flow rate</p></article>
+      <article className="live-card"><div className="live-card-top"><span className={`live-icon ${tone === 'critical' ? 'rose' : tone === 'warning' ? 'amber' : tone === 'unknown' ? 'unknown' : 'green'}`}><ShieldAlert size={18}/></span><span className={`condition-badge ${tone}`}>{isBlocked ? 'DETECTED' : tone === 'warning' ? 'WARNING' : tone === 'unknown' ? 'NO DATA' : 'SAFE'}</span></div><p className="live-card-label">Blockage Detection</p><div className={`status-reading ${tone === 'critical' ? 'is-critical' : tone === 'warning' ? 'is-warning' : ''}`}>{tone === 'critical' ? <AlertTriangle size={16}/> : tone === 'warning' ? <ArrowUp size={16}/> : tone === 'unknown' ? <CircleHelp size={16}/> : <span className='safe-indicator'/>}<strong>{tone === 'unknown' ? 'Awaiting data' : condition.label}</strong></div><p className="live-card-note">Based on water depth and flow rate</p></article>
     </div>
   </>;
 }
@@ -511,7 +529,7 @@ function StationMap({ stations, selectedStation, onOpenStation }) {
   const [tileError, setTileError] = useState(false);
   const sortedStations = sortStations(stations);
   const createNodeIcon = (status, conditionCode) => {
-    const conditionClass = status === 'offline' ? 'offline' : status === 'maintenance' ? 'attention' : conditionCode === 'blockage_detected' ? 'critical' : conditionCode === 'elevated_water' ? 'attention' : 'online';
+    const conditionClass = status === 'offline' ? 'offline' : status === 'maintenance' || conditionCode === 'stagnant_low_flow' || conditionCode === 'elevated_water' ? 'attention' : conditionCode === 'blockage_detected' ? 'critical' : 'online';
     return L.divIcon({
     className: 'leaflet-node-wrap',
     html: `<span class="leaflet-node ${conditionClass}"><i></i></span>`,
@@ -536,7 +554,7 @@ function StationMap({ stations, selectedStation, onOpenStation }) {
           const condition = evaluateDrainageCondition(reading, station);
           const nodeStatus = stationConnectivityStatus(station);
           return <Marker key={station.id || station.station_code || index} position={[latitude, longitude]} icon={createNodeIcon(nodeStatus, condition.code)}>
-            <Popup className="station-leaflet-popup"><div className="leaflet-popup-content"><span className={`leaflet-status ${nodeStatus === 'online' ? 'up' : nodeStatus === 'maintenance' ? 'maintenance' : 'down'}`}><i/>{nodeStatus}</span><strong className="text-slate-900 dark:text-white font-bold">{station.station_code || 'Station node'}</strong><p className="text-slate-600 dark:text-slate-400 font-medium">{station.location_name || 'Calauan, Laguna'}</p><span className={`leaflet-condition ${conditionTone(condition.code)}`}>{condition.label}</span><div className="leaflet-popup-metrics"><span><small className="text-slate-600 dark:text-slate-400 font-medium">WATER DEPTH</small><b className="text-slate-900 dark:text-white font-bold">{formatValue(reading?.water_level_cm)} cm</b></span><span><small className="text-slate-600 dark:text-slate-400 font-medium">FLOW RATE</small><b className="text-slate-900 dark:text-white font-bold">{formatValue(reading?.flow_rate, 2)} L/min</b></span></div><button type="button" onClick={() => onOpenStation(station)}>Open sensor readings <ChevronRight size={14}/></button></div></Popup>
+            <Popup className="station-leaflet-popup"><div className="leaflet-popup-content"><span className={`leaflet-status ${nodeStatus === 'online' ? 'up' : nodeStatus === 'maintenance' ? 'maintenance' : 'down'}`}><i/>{nodeStatus}</span><strong className="text-slate-900 dark:text-white font-bold">{station.station_code || 'Station node'}</strong><p className="text-slate-600 dark:text-slate-400 font-medium">{station.location_name || 'Calauan, Laguna'}</p><span className={`leaflet-condition ${conditionTone(condition.code)}`}>{condition.label}</span><div className="leaflet-popup-metrics"><span><small className="text-slate-600 dark:text-slate-400 font-medium">WATER DEPTH</small><b className="text-slate-900 dark:text-white font-bold">{station.is_online === false || reading?.water_level_cm == null ? '--' : `${formatValue(reading.water_level_cm)} cm`}</b></span><span><small className="text-slate-600 dark:text-slate-400 font-medium">FLOW RATE</small><b className="text-slate-900 dark:text-white font-bold">{station.is_online === false || (reading?.flow_rate_lpm ?? reading?.flow_rate) == null ? '--' : `${formatValue(reading.flow_rate_lpm ?? reading.flow_rate, 2)} L/min`}</b></span></div><button type="button" onClick={() => onOpenStation(station)}>Open sensor readings <ChevronRight size={14}/></button></div></Popup>
           </Marker>;
         })}
       </MapContainer>
@@ -672,7 +690,7 @@ export default function App() {
         if (err.response?.status === 401) logout();
       } finally { if (active) setUserLoading(false); }
     }, 0);
-    const dashboardTimer = window.setInterval(fetchDashboard, 30000);
+    const dashboardTimer = window.setInterval(fetchDashboard, 5000);
     return () => { active = false; window.clearTimeout(initialize); window.clearInterval(dashboardTimer); };
   }, [token, fetchDashboard, logout]);
 
@@ -694,7 +712,7 @@ export default function App() {
   const visibleTabs = isAdmin ? [...tabs, approvalTab] : tabs;
   const role = isAdmin ? 'admin' : 'viewer';
   const onlineStations = stations.filter((station) => stationConnectivityStatus(station) === 'online').length;
-  const attentionStations = stations.filter((station) => stationConnectivityStatus(station) !== 'online' || ['blockage_detected', 'elevated_water'].includes(evaluateDrainageCondition(readingFor(station), station).code)).length;
+  const attentionStations = stations.filter((station) => stationConnectivityStatus(station) !== 'online' || ['blockage_detected', 'elevated_water', 'stagnant_low_flow'].includes(evaluateDrainageCondition(readingFor(station), station).code)).length;
   const selectedStation = stations.find((station) => String(station.id) === String(selectedStationId)) || sortedStations[0];
   const selectTab = (tabId) => {
     if (!visibleTabs.some(({ id }) => id === tabId)) return;
@@ -731,9 +749,9 @@ export default function App() {
 
       {activeTab === 'overview' && <section className="tab-page overview-page">
         <div className="page-intro"><div><p className="eyebrow location-tag"><MapPin size={13}/> CALAUAN, LAGUNA</p><h1>Drainage overview</h1><p className="intro-copy">{userLoading ? 'Loading access profile...' : isAdmin ? 'Admin Portal: Full station control' : 'Resident Portal: Live municipal monitoring view'}</p></div><div className="intro-actions">{isAdmin && <button className="manage-stations-button" type="button" onClick={() => selectTab('map')}><Cog size={15}/>Manage Stations</button>}<button className="refresh-button" onClick={fetchDashboard} disabled={loading}><RefreshCw size={15} className={loading ? 'spin' : ''}/>{loading ? 'Refreshing live data' : 'Refresh live data'}</button></div></div>
-        <div className="summary-row"><div><span className="summary-label">Monitored stations</span><strong>{stations.length.toString().padStart(2, '0')}</strong></div><div><span className="summary-label">Online</span><strong className="text-emerald">{onlineStations.toString().padStart(2, '0')}</strong></div><div><span className="summary-label">Attention required</span><strong className="text-amber">{attentionStations.toString().padStart(2, '0')}</strong></div><div className="summary-updated"><span className="summary-label">Access level</span><strong>{userLoading ? 'Checking role' : isAdmin ? 'Admin / full control' : 'Viewer / live view'}</strong><small>Auto refresh / 30 sec</small></div></div>
+        <div className="summary-row"><div><span className="summary-label">Monitored stations</span><strong>{stations.length.toString().padStart(2, '0')}</strong></div><div><span className="summary-label">Online</span><strong className="text-emerald">{onlineStations.toString().padStart(2, '0')}</strong></div><div><span className="summary-label">Attention required</span><strong className="text-amber">{attentionStations.toString().padStart(2, '0')}</strong></div><div className="summary-updated"><span className="summary-label">Access level</span><strong>{userLoading ? 'Checking role' : isAdmin ? 'Admin / full control' : 'Viewer / live view'}</strong><small>Auto refresh / 5 sec</small></div></div>
         <div className="overview-grid"><section className="overview-panel"><div className="panel-heading"><div><span className="panel-kicker">FIELD NETWORK</span><h2>Station status</h2></div><button className="text-action" onClick={() => selectTab('telemetry')}>Live sensor readings <ChevronRight size={14}/></button></div>{stations.length ? <div className="overview-station-list">{sortedStations.slice(0, 6).map((station, index) => <button className="overview-station-row" key={station.id || station.station_code || index} onClick={() => openStationTelemetry(station)}><span className={`station-health ${stationConnectivityStatus(station) === 'online' ? 'healthy' : stationConnectivityStatus(station) === 'maintenance' ? 'attention' : 'offline'}`}/><span className="overview-node-code">{station.station_code || 'UNASSIGNED'}</span><span className="overview-node-name">{station.location_name || 'Unnamed station'}</span><span className="overview-node-level">{formatValue(readingFor(station)?.water_level_cm)} <small>cm</small></span><ChevronRight size={14}/></button>)}</div> : <div className="inventory-empty">{loading ? 'Loading station nodes...' : 'No stations are currently available.'}</div>}</section>
-          <section className="overview-panel network-panel"><div className="panel-heading"><div><span className="panel-kicker">SYSTEM HEALTH</span><h2>Operations summary</h2></div><span className={`system-state ${networkLive ? 'up' : 'down'}`}><i/>{networkLive ? 'OPERATIONAL' : 'CHECK LINK'}</span></div><div className="operation-metric"><span><Activity size={15}/>API connection</span><strong>{networkLive ? 'Connected' : 'Awaiting response'}</strong></div><div className="operation-metric"><span><Gauge size={15}/>Field stations</span><strong>{onlineStations} / {stations.length} online</strong></div><div className="operation-metric"><span><Clock3 size={15}/>Refresh cadence</span><strong>30 seconds</strong></div><button className="map-shortcut" onClick={() => selectTab('map')}><MapPin size={15}/>Open station map<ChevronRight size={14}/></button></section></div>
+          <section className="overview-panel network-panel"><div className="panel-heading"><div><span className="panel-kicker">SYSTEM HEALTH</span><h2>Operations summary</h2></div><span className={`system-state ${networkLive ? 'up' : 'down'}`}><i/>{networkLive ? 'OPERATIONAL' : 'CHECK LINK'}</span></div><div className="operation-metric"><span><Activity size={15}/>API connection</span><strong>{networkLive ? 'Connected' : 'Awaiting response'}</strong></div><div className="operation-metric"><span><Gauge size={15}/>Field stations</span><strong>{onlineStations} / {stations.length} online</strong></div><div className="operation-metric"><span><Clock3 size={15}/>Refresh cadence</span><strong>5 seconds</strong></div><button className="map-shortcut" onClick={() => selectTab('map')}><MapPin size={15}/>Open station map<ChevronRight size={14}/></button></section></div>
       </section>}
 
       {activeTab === 'telemetry' && <section className="tab-page telemetry-page">{loading && !dashboardData ? <div className="loading-panel compact-loader"><span className="loader"/><p>Refreshing live data...</p></div> : <TelemetryCards station={selectedStation}/>}<div className="station-details"><div className="station-details-label"><PanelsTopLeft size={15}/><span>Station inventory</span><small>{stations.length} registered</small></div>{stations.length ? <div className="station-grid">{sortedStations.map((station, index) => <StationCard key={station.id || station.station_code || index} station={station} stationId={`station-detail-${station.id || station.station_code || index}`}/>)}</div> : <div className="inventory-empty">No stations are currently available. Stations will appear after they are registered with the monitoring service.</div>}</div></section>}
